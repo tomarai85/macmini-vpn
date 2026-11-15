@@ -1,0 +1,139 @@
+#!/bin/bash
+# mmvpn-tunnel — keep a SOCKS proxy open on 127.0.0.1:$SOCKS_PORT that leaves through the Mac at
+# home. Run by launchd (KeepAlive). The PAC file sends only the listed sites here; everything else
+# stays direct.
+#
+# ROUTES, tried in this order
+#   kcp    ssh through the local kcptun client (UDP with error correction). Much faster than plain
+#          ssh on a long path that loses packets. Only when USE_KCP=yes.
+#   ssh    plain ssh to the home Mac.
+#   relay  ssh -J through RELAY, for networks where the home Mac cannot be reached directly. Only
+#          when RELAY is set.
+#
+# CHOOSING
+#   * Every attempt walks all routes in order and skips only a route that failed in the last SKIP
+#     seconds. (An earlier version picked one family of routes from a single reading and spent 27
+#     minutes retrying the wrong one during a real outage.)
+#   * A tunnel that dies within FASTFAIL seconds counts as a failed route. A failed kcp route also
+#     restarts the kcptun client, at most every 5 minutes.
+#   * A working tunnel on a fallback route is moved back to an earlier route only when that route
+#     has not failed for HOLD seconds, two readings in a row agree, and less than 200 KB passed
+#     through the tunnel in 5 seconds. A playing video is never cut. (Counting connections does not
+#     work: an open streaming tab keeps idle connections.)
+#   * If something else already listens on the port, wait instead of fighting for it.
+#
+# Tests: tests/tunnel.test.sh (stubs ssh, nettop, launchctl and nc; nothing real is dialled).
+set -uo pipefail
+CONF_DIR="${MMVPN_CONFIG_DIR:-$HOME/.config/macmini-vpn}"
+# shellcheck source=/dev/null
+[ -f "$CONF_DIR/config" ] && . "$CONF_DIR/config"
+: "${HOME_MAC:?set HOME_MAC=user@address in $CONF_DIR/config}"
+ID="${MMVPN_ID:-com.macminivpn}"
+PORT="${SOCKS_PORT:-1082}"
+KCP_LOCAL="${KCP_LOCAL_PORT:-2222}"
+USE_KCP="${USE_KCP:-yes}"
+RELAY="${RELAY:-}"
+HOME_ADDR="${HOME_MAC#*@}"
+HOME_USER="${HOME_MAC%@*}"
+TICK="${MMVPN_TICK:-30}"          # how often a live tunnel is re-judged
+FASTFAIL="${MMVPN_FASTFAIL:-60}"  # a tunnel that dies sooner than this counts as a failed route
+SKIP="${MMVPN_SKIP:-120}"         # a failed route is skipped this long when choosing
+HOLD="${MMVPN_HOLD:-600}"         # ...and a working tunnel is not swapped for it for this long
+LAUNCHCTL="${LAUNCHCTL_BIN:-launchctl}"
+
+OPTS=(-N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
+      -o ServerAliveCountMax=3 -o ConnectTimeout=10 -D "127.0.0.1:$PORT")
+# Through kcptun the connection goes to 127.0.0.1; HostKeyAlias checks the home Mac's own host key.
+KCPDEST=(-p "$KCP_LOCAL" -o HostKeyAlias="$HOME_ADDR" "$HOME_USER@127.0.0.1")
+
+ROUTES=()
+[ "$USE_KCP" = yes ] && ROUTES+=(kcp)
+ROUTES+=(ssh)
+[ -n "$RELAY" ] && ROUTES+=(relay)
+
+log() { echo "$(date '+%F %T') $*"; }
+
+listening() { nc -z -G 2 127.0.0.1 "$PORT" >/dev/null 2>&1; }
+
+failed_at() { local v="fail_$1"; echo "${!v:-0}"; }
+mark_failed() { printf -v "fail_$1" '%s' "$(date +%s)"; }
+since_failed() { echo $(( $(date +%s) - $(failed_at "$1") )); }
+
+preferred() {  # the first route that has not failed for HOLD seconds (else the first route)
+  local r
+  for r in "${ROUTES[@]}"; do
+    [ "$(since_failed "$r")" -ge "$HOLD" ] && { echo "$r"; return; }
+  done
+  echo "${ROUTES[0]}"
+}
+
+rank() {  # position of route $1 in ROUTES
+  local i
+  for i in "${!ROUTES[@]}"; do [ "${ROUTES[$i]}" = "$1" ] && { echo "$i"; return; }; done
+  echo 99
+}
+
+kicked=0
+kick() {  # restart the kcptun client behind a failed kcp route (at most every 5 min)
+  [ "$1" = kcp ] || return 0
+  local now; now=$(date +%s)
+  if [ $(( now - kicked )) -ge 300 ]; then
+    kicked=$now
+    "$LAUNCHCTL" kickstart -k "gui/$(id -u)/$ID.kcp" >/dev/null 2>&1
+  fi
+}
+
+start_route() {  # start the tunnel for route $1 in the background; sets pid
+  case "$1" in
+    kcp)   ssh "${OPTS[@]}" "${KCPDEST[@]}" & ;;
+    ssh)   ssh "${OPTS[@]}" "$HOME_MAC" & ;;
+    relay) ssh "${OPTS[@]}" -J "$RELAY" "$HOME_MAC" & ;;
+  esac
+  pid=$!
+}
+
+idle() {  # true when less than 200 KB came through tunnel $1 in the last 5 s
+  local b
+  b=$(nettop -P -L 2 -d -s 5 -J bytes_in -p "$1" 2>/dev/null | tail -1 | cut -d, -f2)
+  [ -n "$b" ] && [ "$b" -lt 200000 ] 2>/dev/null
+}
+
+while true; do
+  if listening; then sleep 15; continue; fi
+  tried=0
+  for route in "${ROUTES[@]}"; do
+    [ "$(since_failed "$route")" -lt "$SKIP" ] && continue
+    tried=1
+    log "$route"
+    started=$(date +%s)
+    start_route "$route"
+    streak=0; switched=0
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep "$TICK"
+      kill -0 "$pid" 2>/dev/null || break
+      want=$(preferred)
+      # Only ever move to an EARLIER route: a later one is a fallback, never an upgrade.
+      if [ "$(rank "$want")" -lt "$(rank "$route")" ] && [ "$(since_failed "$want")" -ge "$HOLD" ]; then
+        streak=$((streak + 1))
+      else
+        streak=0
+      fi
+      if [ "$streak" -ge 2 ] && idle "$pid"; then
+        log "$want is available again; switching from $route"
+        switched=1
+        kill "$pid" 2>/dev/null
+        break
+      fi
+    done
+    wait "$pid" 2>/dev/null
+    if [ "$switched" = 0 ] && [ $(( $(date +%s) - started )) -lt "$FASTFAIL" ]; then
+      log "$route failed within ${FASTFAIL}s; trying the next route"
+      mark_failed "$route"
+      kick "$route"
+      continue
+    fi
+    break  # it ran for a while, or was replaced on purpose: choose again from the top
+  done
+  [ "$tried" = 0 ] && sleep 5
+  sleep 2
+done

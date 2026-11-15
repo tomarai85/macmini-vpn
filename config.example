@@ -1,0 +1,20 @@
+# Mac mini VPN — settings for the Mac you travel with.
+# Copy to ~/.config/macmini-vpn/config, edit, then run ./install.sh.
+
+# The Mac in Japan, as you would reach it with ssh: user@address.
+# With Tailscale, use its Tailscale address (100.x.y.z) or its MagicDNS name.
+HOME_MAC="user@100.64.0.1"
+
+# kcptun makes the tunnel much faster over a long path that loses packets. Needs kcptun on both
+# Macs (brew install kcptun) and home/install-home.sh run on the Mac in Japan. yes or no.
+USE_KCP="yes"
+KCP_PORT=4000            # UDP port kcptun listens on at home (same as in install-home.sh)
+
+# Optional: another machine to hop through when the Mac in Japan can't be reached directly
+# (passed to ssh -J). Leave empty if you don't have one.
+RELAY=""
+
+# Local ports on this Mac. Change them only if something else already uses them.
+SOCKS_PORT=1082          # the tunnel
+PAC_PORT=1081            # serves the PAC file
+KCP_LOCAL_PORT=2222      # the kcptun client
