@@ -99,11 +99,12 @@ home/uninstall-home.sh    # on the Mac in Japan
 
 - **[Tailscale exit node](https://tailscale.com/kb/1103/exit-nodes).** The simplest setup: make the home Mac an exit node and turn it on wherever you are. It works on an Apple TV too. The drawback is that *all* traffic goes through Japan, so everything else gets slower too, and every site sees you as in Japan.
 - **Tailscale App Connectors.** These route chosen domains through a connector node, but the connector has to run on Linux.
-- **[Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev), ClashX Meta and [Proxy Switchboard](https://ptrinh.github.io/proxy-switchboard-dist/).** Rule-based proxy apps with a menu-bar toggle. You bring and maintain the server and the tunnel yourself.
+- **[Proxy Switchboard](https://ptrinh.github.io/proxy-switchboard-dist/).** The closest app to this one: per-site rules over SSH, SOCKS5, WireGuard and more, with failover and a menu-bar switch. You write the rules and set up the home end yourself.
+- **[Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev) and ClashX Meta.** Rule-based proxy clients with a menu-bar toggle. You bring the server and the tunnel.
 - **`ssh -D` plus a browser proxy extension.** The classic do-it-yourself setup. Nothing keeps the tunnel up, and it doesn't cope with a lossy long-distance path.
 - **Your home router's VPN server.** Many Japanese routers have one (L2TP/IPsec). It routes the whole device and needs the router's admin settings.
 
-Mac mini VPN fills the gap between these: per-site routing, a home exit, a tunnel that repairs itself and a one-click switch.
+What Mac mini VPN adds is the ready-made part. It comes with the list of Japanese video hosts, including the ones the video actually streams from. It sets up the home end, uses kcptun for a lossy path between continents, and checks the exit by asking ABEMA rather than by "connected". It turns on only when that check passes.
 
 ## A note on terms
 
