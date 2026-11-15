@@ -82,7 +82,7 @@ The app and the tunnel start again by themselves after a restart. **Quit** in th
 
 ## Tips
 
-- **Put the home Mac on Ethernet.** This makes the biggest difference. In one home the Mac was on a busy Wi-Fi channel, and the round trip to its own router averaged 250–330 ms and peaked at 3 s. Every new connection to the Japanese sites took 1.3–1.8 s, while every other site stayed fast.
+- **Put the home Mac on Ethernet, or turn off AWDL on it.** AWDL is the Wi-Fi link behind AirDrop, AirPlay and Continuity, and it takes the radio away from its own channel at regular intervals. One home Mac on Wi-Fi had a median round trip of 180 ms to its own router, with peaks over 1 s. Every new connection to the Japanese sites took 1.3–1.8 s, while every other site stayed fast. After `sudo ifconfig awdl0 down`, the median was 4 ms. AirDrop, AirPlay and Continuity to that Mac stop working, and AWDL comes back after a restart.
 - **"Not seen as Japan"** means the exit answers, but ABEMA doesn't accept it as Japan. Check that the home Mac isn't itself on a VPN.
 - **"Home Mac not responding"** means the home Mac is off, asleep or offline, or that ssh asks for a password. Try `ssh user@address true`.
 - Logs are in `~/.config/macmini-vpn/logs/`. The tunnel logs every route it tries.
