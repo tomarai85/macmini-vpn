@@ -82,7 +82,7 @@ The app and the tunnel start again by themselves after a restart. **Quit** in th
 
 ## Tips
 
-- **On the home Mac, set AirDrop to Contacts Only, or use Ethernet.** With AirDrop set to *Everyone*, the Mac keeps AWDL (the Wi-Fi link behind AirDrop) listening, which takes the radio off its own channel for about 0.6 s of every second. On one home Mac this put the median round trip to its own router at 350 ms, and every new connection to the Japanese sites took 1.3–1.8 s while every other site stayed fast. Changing only AirDrop to *Contacts Only* or *No One* brought the median to 4 ms. AirDrop still works, and Control Center's "Everyone for 10 minutes" switches back by itself.
+- **On the home Mac, set AirDrop to Contacts Only, or use Ethernet.** With AirDrop set to *Everyone*, the Mac keeps AWDL (the Wi-Fi link behind AirDrop) listening, which takes the radio off its own channel for about 0.6 s of every second. On one home Mac this put the median round trip to its own router at 350 ms, and every new connection to the Japanese sites took 1.3–1.8 s while every other site stayed fast. Changing only AirDrop to *Contacts Only* or *No One* brought the median to 4 ms. Contacts Only lets your contacts AirDrop to the Mac only if it is signed in to an Apple Account and has their Apple Account email or phone number in Contacts. Otherwise, set it to Everyone while you need it.
 - **"Not seen as Japan"** means the exit answers, but ABEMA doesn't accept it as Japan. Check that the home Mac isn't itself on a VPN.
 - **"Home Mac not responding"** means the home Mac is off, asleep or offline, or that ssh asks for a password. Try `ssh user@address true`.
 - Logs are in `~/.config/macmini-vpn/logs/`. The tunnel logs every route it tries.
