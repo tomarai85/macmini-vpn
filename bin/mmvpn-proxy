@@ -1,0 +1,307 @@
+#!/usr/bin/python3
+"""mmvpn-proxy: Mac mini VPN's local server on 127.0.0.1:PAC_PORT (launchd, KeepAlive).
+
+It does two jobs on one port:
+
+1. GET /jp.pac?routes=sites,rest serves the routing PAC. The template is pac/jp.pac in the config
+   folder; the site list is the `sites` file there; the routes come from the URL, which `mmvpn set`
+   writes as the system's automatic-proxy URL. A change of routes is therefore a change of URL, and
+   browsers fetch the new PAC at once: a browser or app keeps a PAC for as long as its URL stays the
+   same. The bare /jp.pac (the URL of the one-switch version) means the sites only.
+
+2. CONNECT host:port relays programs that read HTTPS_PROXY but not a PAC, such as Claude Code, curl,
+   git and most command-line tools. While the file `tools-via-japan` exists in the config folder,
+   each new connection goes through the tunnel (SOCKS5 on 127.0.0.1:SOCKS_PORT, the name resolved in
+   Japan); otherwise it goes direct.
+
+FAIL-OPEN, ON PURPOSE. Everything pointed at this relay reaches the internet through it. If the
+tunnel does not answer within SOCKS_TIMEOUT, the connection goes direct instead of failing, and the
+tunnel is skipped for TUNNEL_PAUSE seconds so later connections do not each wait. A home Mac that is
+off must never stop your work. The listed sites are the opposite case and are not relayed here: the
+PAC sends them to the tunnel with no DIRECT fallback.
+
+Addresses on this Mac's own networks (loopback, private, link-local, Tailscale's 100.64/10, .local,
+.ts.net and names without a dot) always go direct.
+
+Only the PAC and /status are served; no file in the config folder is readable through this port.
+Settings: MMVPN_CONFIG_DIR (default ~/.config/macmini-vpn) and PAC_PORT / SOCKS_PORT in its config.
+"""
+import asyncio
+import ipaddress
+import json
+import os
+import re
+import resource
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs
+
+CONF_DIR = os.environ.get("MMVPN_CONFIG_DIR", os.path.expanduser("~/.config/macmini-vpn"))
+
+
+def read_config(path):
+    """KEY=value lines of the shell config the installer and the scripts share (quotes stripped)."""
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                val = val.split(" #", 1)[0].strip().strip("\"'")
+                out[key.strip()] = val
+    except OSError:
+        pass
+    return out
+
+
+CONF = read_config(os.path.join(CONF_DIR, "config"))
+PORT = int(CONF.get("PAC_PORT") or 1081)
+SOCKS_PORT = int(CONF.get("SOCKS_PORT") or 1082)
+TEMPLATE = os.path.join(CONF_DIR, "pac", "jp.pac")
+SITES_FILE = os.path.join(CONF_DIR, "sites")
+FLAG = os.path.join(CONF_DIR, "tools-via-japan")
+SOCKS_TIMEOUT = float(os.environ.get("MMVPN_SOCKS_TIMEOUT", "6"))
+TUNNEL_PAUSE = float(os.environ.get("MMVPN_TUNNEL_PAUSE", "30"))
+# Test seam: lets the tests send 127.0.0.1 through a fake tunnel. Never set in normal use.
+ROUTE_LOCAL = os.environ.get("MMVPN_TEST_ROUTE_LOCAL") == "1"
+PAC_ROUTES = ("sites", "rest")           # what a PAC can route; terminal tools use the relay
+DEFAULT_ROUTES = ("sites",)              # the bare /jp.pac
+SITE_RE = re.compile(r"^[a-z0-9*][a-z0-9*.-]*\.[a-z0-9*-]+$")
+LOCAL_SUFFIXES = (".local", ".localhost", ".internal", ".lan", ".home.arpa", ".ts.net")
+stats = {"via_japan": 0, "direct": 0, "fell_back": 0, "failed": 0, "since": time.strftime("%F %T")}
+_last_fallback_logged = 0.0
+_tunnel_paused_until = 0.0
+
+
+def log(msg):
+    sys.stderr.write(time.strftime("%F %T ") + msg + "\n")
+    sys.stderr.flush()
+
+
+def local_address(host):
+    """True for a destination on this Mac's own networks, which never goes through Japan."""
+    h = host.strip("[]").rstrip(".").lower()
+    try:
+        return not ipaddress.ip_address(h).is_global
+    except ValueError:
+        return "." not in h or h == "localhost" or h.endswith(LOCAL_SUFFIXES)
+
+
+def routes_from(query):
+    q = parse_qs(query, keep_blank_values=True)
+    if "routes" not in q:
+        return DEFAULT_ROUTES
+    asked = {r for v in q["routes"] for r in v.split(",")}
+    return tuple(r for r in PAC_ROUTES if r in asked)
+
+
+def read_sites():
+    """The site list: one domain or *-pattern per line. A line that is not a plain host name or
+    pattern is skipped with a log line, so a typo can never break the PAC (or inject code into it)."""
+    sites = []
+    try:
+        with open(SITES_FILE, encoding="utf-8") as f:
+            for n, line in enumerate(f, 1):
+                s = line.split("#", 1)[0].strip().lower().lstrip(".")
+                if not s:
+                    continue
+                if SITE_RE.match(s) and s not in sites:
+                    sites.append(s)
+                elif s not in sites:
+                    log("sites line %d skipped: %r is not a domain or *-pattern" % (n, s))
+    except OSError:
+        pass
+    return sites
+
+
+def pac(query):
+    with open(TEMPLATE, encoding="utf-8") as f:
+        body = f.read()
+    return (body.replace("__ROUTES__", ",".join(routes_from(query)))
+                .replace("/*__SITES__*/", ", ".join(json.dumps(s) for s in read_sites()))
+                .replace("__SOCKS_PORT__", str(SOCKS_PORT)))
+
+
+async def reply(writer, status, body=b"", ctype="text/plain", head_only=False):
+    writer.write(("HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
+                  "Cache-Control: no-store\r\nConnection: close\r\n\r\n"
+                  % (status, ctype, len(body))).encode())
+    if not head_only:
+        writer.write(body)
+    await writer.drain()
+
+
+async def serve(method, target, writer):
+    path, _, query = target.partition("?")
+    head_only = method == "HEAD"
+    if path == "/jp.pac":
+        try:
+            body = pac(query).encode()
+        except OSError as e:
+            log("cannot read the PAC template: %s" % e)
+            return await reply(writer, "500 Internal Server Error", b"no PAC template\n")
+        return await reply(writer, "200 OK", body, "application/x-ns-proxy-autoconfig", head_only)
+    if path == "/status":
+        body = json.dumps(dict(stats, tools_via_japan=os.path.exists(FLAG),
+                               tunnel_paused=time.time() < _tunnel_paused_until)).encode()
+        return await reply(writer, "200 OK", body, "application/json", head_only)
+    return await reply(writer, "404 Not Found", b"not found\n")
+
+
+async def socks_open(host, port):
+    """Open host:port through the SOCKS5 tunnel; a name is resolved in Japan (socks5h)."""
+    r, w = await asyncio.open_connection("127.0.0.1", SOCKS_PORT)
+    try:
+        w.write(b"\x05\x01\x00")
+        await w.drain()
+        if await r.readexactly(2) != b"\x05\x00":
+            raise ConnectionError("SOCKS greeting refused")
+        try:
+            ip = ipaddress.ip_address(host)
+            addr = (b"\x01" if ip.version == 4 else b"\x04") + ip.packed
+        except ValueError:
+            name = host.encode("idna")
+            addr = b"\x03" + bytes([len(name)]) + name
+        w.write(b"\x05\x01\x00" + addr + port.to_bytes(2, "big"))
+        await w.drain()
+        rep = await r.readexactly(4)
+        if rep[1] != 0:
+            raise ConnectionError("SOCKS connect failed, code %d" % rep[1])
+        skip = {1: 4, 4: 16}.get(rep[3])
+        if skip is None:
+            skip = (await r.readexactly(1))[0]
+        await r.readexactly(skip + 2)
+        return r, w
+    except BaseException:
+        w.close()
+        raise
+
+
+async def pump(src, dst):
+    try:
+        while True:
+            data = await src.read(65536)
+            if not data:
+                break
+            dst.write(data)
+            await dst.drain()
+    except (ConnectionError, OSError, asyncio.IncompleteReadError):
+        pass
+    finally:
+        try:
+            if dst.can_write_eof():
+                dst.write_eof()
+        except (OSError, RuntimeError):
+            pass
+
+
+async def connect(target, reader, writer):
+    global _last_fallback_logged, _tunnel_paused_until
+    host, _, port_s = target.rpartition(":")
+    host = host.strip("[]")
+    try:
+        port = int(port_s)
+    except ValueError:
+        port = 0
+    if not host or not 1 <= port <= 65535:
+        return await reply(writer, "400 Bad Request", b"bad CONNECT target\n")
+    upstream = None
+    if os.path.exists(FLAG) and (ROUTE_LOCAL or not local_address(host)):
+        if time.time() < _tunnel_paused_until:
+            stats["fell_back"] += 1
+        else:
+            try:
+                upstream = await asyncio.wait_for(socks_open(host, port), SOCKS_TIMEOUT)
+                stats["via_japan"] += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:   # any tunnel trouble at all: go direct (fail-open)
+                stats["fell_back"] += 1
+                now = time.time()
+                _tunnel_paused_until = now + TUNNEL_PAUSE
+                if now - _last_fallback_logged > 60:   # one line a minute at most
+                    _last_fallback_logged = now
+                    log("tunnel did not answer (%s: %s); going direct for %ds"
+                        % (type(e).__name__, e, TUNNEL_PAUSE))
+    if upstream is None:
+        try:
+            upstream = await asyncio.wait_for(
+                asyncio.open_connection(host, port, happy_eyeballs_delay=0.25), 20)
+            stats["direct"] += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:   # unresolvable, refused, timed out, or a name idna cannot encode
+            stats["failed"] += 1
+            return await reply(writer, "502 Bad Gateway", ("%s\n" % e).encode())
+    ur, uw = upstream
+    writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+    await writer.drain()
+    a = asyncio.ensure_future(pump(reader, uw))
+    b = asyncio.ensure_future(pump(ur, writer))
+    done, pending = await asyncio.wait({a, b}, return_when=asyncio.FIRST_COMPLETED)
+    if pending:
+        # One side closed. Give the other side time to finish, then stop: a peer that never closes
+        # would otherwise hold two sockets forever.
+        _, pending = await asyncio.wait(pending, timeout=120)
+        for t in pending:
+            t.cancel()
+    uw.close()
+
+
+async def handle(reader, writer):
+    try:
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 15)
+        except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError,
+                ConnectionError):
+            return
+        parts = head.split(b"\r\n", 1)[0].decode("latin-1").split()
+        if len(parts) != 3:
+            return await reply(writer, "400 Bad Request", b"bad request\n")
+        method, target = parts[0].upper(), parts[1]
+        if method == "CONNECT":
+            await connect(target, reader, writer)
+        elif method in ("GET", "HEAD"):
+            await serve(method, target, writer)
+        else:
+            await reply(writer, "405 Method Not Allowed", b"only CONNECT, GET and HEAD\n")
+    except (ConnectionError, OSError):
+        pass
+    except Exception as e:  # one bad connection must never take the relay down
+        log("error: %s: %s" % (type(e).__name__, e))
+    finally:
+        writer.close()
+
+
+def raise_fd_limit():
+    """launchd starts agents with 256 open files: about 120 relayed connections. Past that, accept()
+    fails and new connections hang."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    for want in (65536, 10240, 4096):
+        target = want if hard == resource.RLIM_INFINITY else min(want, hard)
+        if target <= soft:
+            return
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            return
+        except (ValueError, OSError):
+            continue
+
+
+async def main():
+    raise_fd_limit()
+    # Name lookups for direct connections run in threads, and a lookup that hangs keeps its thread
+    # after the connection times out. The default pool is small enough for one Wi-Fi drop to fill it.
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=128))
+    server = await asyncio.start_server(handle, "127.0.0.1", PORT, reuse_address=True, backlog=512)
+    log("listening on 127.0.0.1:%d (template %s, sites %d, tunnel %d, open-file limit %d)"
+        % (PORT, TEMPLATE, len(read_sites()), SOCKS_PORT, resource.getrlimit(resource.RLIMIT_NOFILE)[0]))
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

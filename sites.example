@@ -1,0 +1,44 @@
+# The sites the "Chosen sites" switch sends through the Mac in Japan. The installer copies this file
+# to ~/.config/macmini-vpn/sites the first time and never overwrites your copy. After an edit, apply
+# it with the menu (switch "Chosen sites" off and on) or `mmvpn set sites` (plus any other routes
+# you want); browsers and apps then fetch the new list at once.
+#
+# One entry per line; # starts a comment.
+#   example.jp              the domain and every name under it (www.example.jp, cdn.example.jp)
+#   *-video.cdn.example     a pattern with *, matched against the whole host name
+# Every host of a listed site goes through the same exit, sign-in and video included, with no
+# fallback. List the domains the video streams from too: they are often not the site's own domain.
+# Your browser's developer tools (Network tab) show them.
+#
+# Shared CDNs such as akamaized.net carry many companies' traffic, so a pattern for one should name
+# the service at a hyphen or label boundary (*-abematv.akamaized.net), never the whole CDN.
+
+# ABEMA: pages, API, and video from Akamai
+abema.tv
+abema.io
+*-abematv.akamaized.net
+abematv.akamaized.net
+
+# TVer
+tver.jp
+
+# radiko: pages, and audio from its own CDNs
+radiko.jp
+*-radiko.smartstream.ne.jp
+radiko.smartstream.ne.jp
+*.radiko-cf.com
+
+# NHK: pages, and simulcast video
+nhk.or.jp
+nhk.jp
+*.drdi.st.nhk
+
+# Netflix: pages, sign-in, scripts (nflxext.com), images (nflxso.net, nflximg.net/.com) and video
+# (Open Connect, nflxvideo.net)
+netflix.com
+netflix.net
+nflxvideo.net
+nflxso.net
+nflximg.net
+nflximg.com
+nflxext.com

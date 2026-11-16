@@ -1,7 +1,7 @@
 #!/bin/bash
 # mmvpn-tunnel — keep a SOCKS proxy open on 127.0.0.1:$SOCKS_PORT that leaves through the Mac at
-# home. Run by launchd (KeepAlive). The PAC file sends only the listed sites here; everything else
-# stays direct.
+# home. Run by launchd (KeepAlive). The PAC (sites, everything else) and the relay (terminal tools)
+# send what is switched on here; everything else stays direct.
 #
 # ROUTES, tried in this order
 #   kcp    ssh through the local kcptun client (UDP with error correction). Much faster than plain

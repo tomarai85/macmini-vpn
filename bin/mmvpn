@@ -1,86 +1,138 @@
 #!/bin/bash
-# mmvpn — turn Mac mini VPN on or off from a terminal. The menu-bar app runs the same commands.
+# mmvpn — choose what leaves through the Mac at home, from a terminal. The menu-bar app runs the same
+# commands.
 #
-#   mmvpn up      start the tunnel, wait until it answers from Japan, then turn on site routing
-#   mmvpn down    turn off site routing and stop the tunnel
-#   mmvpn status  what is on, and where the exit is
+#   mmvpn set [sites] [tools] [rest]   the full set that goes through Japan; nothing = all off
+#   mmvpn up                           = set sites
+#   mmvpn down                         = set (everything direct, tunnel stopped)
+#   mmvpn status                       what is on, and where the exit is
+#
+#   sites  the sites in ~/.config/macmini-vpn/sites, with their sign-in and video (PAC)
+#   tools  programs that read HTTPS_PROXY, such as Claude Code, curl and git, once you point
+#          HTTPS_PROXY at http://127.0.0.1:PAC_PORT (mmvpn-proxy's relay)
+#   rest   everything else that follows the system proxy setting: browsers and most apps (PAC)
 #
 # WHAT CHANGES ON YOUR MAC
-# One setting: the automatic proxy configuration URL, on every network service, so Wi-Fi, Ethernet
-# and tethering behave the same. It points at the PAC file served on 127.0.0.1, which sends only the
-# listed sites to the tunnel. Everything else, including every other app, goes direct as before.
-# `down` clears it. The routing table is never touched.
+# * The automatic proxy configuration URL, on every network service, so Wi-Fi, Ethernet and
+#   tethering behave the same: http://127.0.0.1:PAC_PORT/jp.pac?routes=...&v=... while sites or rest
+#   is on, cleared otherwise. The routes and v (a hash of the PAC as served) are in the URL, so each
+#   change is a new URL: browsers and Mac apps keep a PAC for as long as its URL stays the same.
+# * The file tools-via-japan in the config folder, present while tools is on. The relay reads it for
+#   every new connection.
+# * The tunnel agent: started when anything is on, stopped when nothing is.
+# The routing table and DNS are never touched.
 #
-# FAIL-CLOSED: `up` turns routing on only once the exit answers from Japan. With routing on and no
-# exit, the listed sites break while everything else works, which looks like "the VPN broke the
-# internet".
+# FAIL-SAFE ORDER: a change that keeps or adds a route happens only after the exit answers from Japan
+# and the local server answers. If either does not, NOTHING changes (exit 1). Turning everything off
+# always works. With routing on and no exit, the chosen sites break while everything else works,
+# which looks like "the VPN broke the internet"; and a failed check must not cut a video that is
+# playing just because another route was being added.
 set -uo pipefail
 CONF_DIR="${MMVPN_CONFIG_DIR:-$HOME/.config/macmini-vpn}"
 # shellcheck source=/dev/null
 [ -f "$CONF_DIR/config" ] && . "$CONF_DIR/config"
 ID="${MMVPN_ID:-com.macminivpn}"
 PORT="${SOCKS_PORT:-1082}"
-PAC="http://127.0.0.1:${PAC_PORT:-1081}/jp.pac"
+PAC_BASE="http://127.0.0.1:${PAC_PORT:-1081}/jp.pac"
+FLAG="$CONF_DIR/tools-via-japan"
 LABEL="$ID.tunnel"
 PLIST="${MMVPN_AGENTS_DIR:-$HOME/Library/LaunchAgents}/$LABEL.plist"
 # Seams so the tests never touch the real proxy setting, the real agents or the network.
 NETWORKSETUP="${NETWORKSETUP_BIN:-networksetup}"
 LAUNCHCTL="${LAUNCHCTL_BIN:-launchctl}"
+SCUTIL="${SCUTIL_BIN:-scutil}"
 CURL="${CURL_BIN:-curl}"
-WAIT="${MMVPN_WAIT:-40}"
+WAIT="${MMVPN_WAIT:-40}"                                         # seconds, a deadline
+SERVER="${MMVPN_SERVER:-http://127.0.0.1:${PAC_PORT:-1081}}"     # where mmvpn-proxy is asked
 
-pac() {  # pac on|off — every network service
+usage() { echo "usage: mmvpn set [sites] [tools] [rest] | up | down | status"; exit 2; }
+
+pac() {  # pac <url> | pac off — every network service
   "$NETWORKSETUP" -listallnetworkservices 2>/dev/null | tail -n +2 | sed 's/^\*//' | while read -r svc; do
     [ -z "$svc" ] && continue
-    if [ "$1" = on ]; then
-      "$NETWORKSETUP" -setautoproxyurl "$svc" "$PAC" >/dev/null 2>&1
-    else
+    if [ "$1" = off ]; then
       "$NETWORKSETUP" -setautoproxystate "$svc" off >/dev/null 2>&1
+    else
+      "$NETWORKSETUP" -setautoproxyurl "$svc" "$1" >/dev/null 2>&1
     fi
   done
 }
 
-exit_country() {  # the country the exit reports, or empty when the tunnel does not answer
-  "$CURL" -s -m 15 -x "socks5h://127.0.0.1:$PORT" 'http://ip-api.com/json/?fields=country' 2>/dev/null \
+exit_country() {  # exit_country [timeout]: the exit's country, or empty when the tunnel does not answer
+  "$CURL" -s -m "${1:-15}" -x "socks5h://127.0.0.1:$PORT" 'http://ip-api.com/json/?fields=country' 2>/dev/null \
     | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("country",""))' 2>/dev/null
 }
 
-routing_on() {
-  scutil --proxy 2>/dev/null | grep -q "ProxyAutoConfigURLString : $PAC" &&
-    scutil --proxy 2>/dev/null | grep -q 'ProxyAutoConfigEnable : 1'
+current() {  # the routes in force now, space-separated
+  local p url="" r=""
+  p="$("$SCUTIL" --proxy 2>/dev/null)"
+  if printf '%s\n' "$p" | grep -q 'ProxyAutoConfigEnable : 1'; then
+    url="$(printf '%s\n' "$p" | sed -n 's/^ *ProxyAutoConfigURLString : //p')"
+  fi
+  local q=""
+  case "$url" in
+    "$PAC_BASE") q="sites" ;;                       # the bare URL of the one-switch version
+    "$PAC_BASE?routes="*) q="${url#*routes=}"; q="${q%%&*}" ;;
+  esac
+  case ",$q," in *,sites,*) r="sites" ;; esac
+  [ -f "$FLAG" ] && r="${r:+$r }tools"
+  case ",$q," in *,rest,*) r="${r:+$r }rest" ;; esac
+  echo "$r"
 }
 
 status() {
-  local c; c="$(exit_country)"
-  printf '  exit          : %s\n' "${c:-no answer}"
-  if routing_on; then
-    printf '  site routing  : on (only the sites in jp.pac go through Japan)\n'
-  else
-    printf '  site routing  : off (everything goes direct)\n'
+  local c r; c="$(exit_country)"; r="$(current)"
+  printf '  exit           : %s\n' "${c:-no answer}"
+  printf '  through Japan  : %s\n' "${r:-nothing (everything direct)}"
+}
+
+set_routes() {
+  local sites=0 tools=0 rest=0 a list=""
+  for a in "$@"; do
+    case "$a" in sites) sites=1 ;; tools) tools=1 ;; rest) rest=1 ;; *) usage ;; esac
+  done
+
+  if [ $((sites + tools + rest)) -eq 0 ]; then
+    pac off
+    rm -f "$FLAG"
+    "$LAUNCHCTL" bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+    status
+    return 0
   fi
+
+  "$LAUNCHCTL" bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 \
+    || "$LAUNCHCTL" kickstart "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+  local c="" deadline=$((SECONDS + WAIT))
+  while :; do
+    c="$(exit_country 5)"; [ "$c" = Japan ] && break
+    [ $SECONDS -ge $deadline ] && break
+    sleep 1
+  done
+  if [ "$c" != Japan ]; then
+    echo "The Mac at home is not answering (${c:-no answer}). Nothing was changed."
+    return 1
+  fi
+
+  [ $sites = 1 ] && list="sites"
+  [ $rest = 1 ] && list="${list:+$list,}rest"
+  # The local server must be up and serve exactly these routes. With it down, browsers silently go
+  # direct and the tools relay is gone, while the settings would claim Japan.
+  local body
+  body="$("$CURL" -s -m 3 "$SERVER/jp.pac?routes=$list" 2>/dev/null)"
+  if ! printf '%s' "$body" | grep -qF "var ROUTES = \"$list\";"; then
+    echo "The local server (mmvpn-proxy, $SERVER) is not answering. Nothing was changed."
+    return 1
+  fi
+  local ver; ver="$(printf '%s' "$body" | shasum | cut -c1-8)"
+  if [ -n "$list" ]; then pac "$PAC_BASE?routes=$list&v=$ver"; else pac off; fi
+  if [ $tools = 1 ]; then mkdir -p "$CONF_DIR" && : > "$FLAG"; else rm -f "$FLAG"; fi
+  status
 }
 
 case "${1:-status}" in
-  up)
-    "$LAUNCHCTL" bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 \
-      || "$LAUNCHCTL" kickstart "gui/$(id -u)/$LABEL" >/dev/null 2>&1
-    c=""
-    for _ in $(seq 1 "$WAIT"); do
-      c="$(exit_country)"; [ "$c" = Japan ] && break; sleep 1
-    done
-    if [ "$c" = Japan ]; then
-      pac on; status
-    else
-      pac off
-      echo "The Mac at home is not answering (${c:-no answer}). Site routing stays off."
-      exit 1
-    fi
-    ;;
-  down)
-    pac off
-    "$LAUNCHCTL" bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
-    status
-    ;;
+  set)    shift; set_routes "$@" ;;
+  up)     set_routes sites ;;
+  down)   set_routes ;;
   status) status ;;
-  *) echo "usage: mmvpn up|down|status"; exit 2 ;;
+  *)      usage ;;
 esac

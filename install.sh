@@ -2,15 +2,17 @@
 # install.sh — set up Mac mini VPN on the Mac you travel with. Safe to run again after a change.
 #
 #   ./install.sh            install, start the background parts and the menu-bar app
-#   ./install.sh --no-app   everything except the menu-bar app (terminal use: mmvpn up / down)
+#   ./install.sh --no-app   everything except the menu-bar app (terminal use: mmvpn set ...)
 #
 # Installs, all under your own user (no sudo):
-#   ~/.config/macmini-vpn/       config (you write it), pac/jp.pac, kcp-client.json, logs/
-#   ~/.local/bin/mmvpn           on/off from a terminal
+#   ~/.config/macmini-vpn/       config (you write it), sites (yours to edit), pac/jp.pac,
+#                                kcp-client.json, logs/
+#   ~/.local/bin/mmvpn           the switches, from a terminal
+#   ~/.local/bin/mmvpn-proxy     serves the PAC and relays programs that use HTTPS_PROXY
 #   ~/.local/bin/mmvpn-tunnel    keeps the tunnel open
 #   ~/Applications/Mac mini VPN.app
 #   ~/Library/LaunchAgents/com.macminivpn.{pac,kcp,tunnel,app}.plist
-# Routing stays off until you turn it on.
+# Routing stays off until you turn it on. Your config and your sites file are never overwritten.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WITH_APP=1
@@ -54,11 +56,12 @@ fi
 mkdir -p "$CONF_DIR/pac" "$CONF_DIR/logs" "$BIN_DIR" "$AGENTS"
 
 # 1. scripts
-install -m 755 "$HERE/bin/mmvpn" "$HERE/bin/mmvpn-tunnel" "$BIN_DIR/"
+install -m 755 "$HERE/bin/mmvpn" "$HERE/bin/mmvpn-proxy" "$HERE/bin/mmvpn-tunnel" "$BIN_DIR/"
 
-# 2. PAC, pointed at this SOCKS port (only that file is served, not the config folder)
-sed "s/SOCKS5 127\.0\.0\.1:1082/SOCKS5 127.0.0.1:$SOCKS_PORT/" "$HERE/pac/jp.pac" > "$CONF_DIR/pac/jp.pac"
-grep -q "SOCKS5 127.0.0.1:$SOCKS_PORT\"" "$CONF_DIR/pac/jp.pac" || die "could not set the port in jp.pac"
+# 2. the PAC template (mmvpn-proxy fills in the routes, the sites and the SOCKS port when it serves
+# it) and, the first time only, the site list
+install -m 644 "$HERE/pac/jp.pac" "$CONF_DIR/pac/jp.pac"
+[ -f "$CONF_DIR/sites" ] || install -m 644 "$HERE/sites.example" "$CONF_DIR/sites"
 
 # 3. kcptun client settings. mtu 1200 fits inside Tailscale's 1280-byte packets. No encryption at
 # this layer: ssh inside it encrypts everything (and Tailscale does too).
@@ -114,7 +117,7 @@ reload() {  # (re)start an agent so a re-install takes effect
   "$LAUNCHCTL" bootstrap "gui/$(id -u)" "$AGENTS/$ID.$1.plist"
 }
 
-agent pac true /usr/bin/python3 -m http.server "$PAC_PORT" --bind 127.0.0.1 --directory "$CONF_DIR/pac"
+agent pac true /usr/bin/python3 "$BIN_DIR/mmvpn-proxy"
 reload pac
 if [ "$USE_KCP" = yes ]; then
   agent kcp true "$KCPTUN_CLIENT" -c "$CONF_DIR/kcp-client.json"
@@ -123,7 +126,7 @@ else
   "$LAUNCHCTL" bootout "gui/$(id -u)/$ID.kcp" >/dev/null 2>&1 || true
   rm -f "$AGENTS/$ID.kcp.plist"
 fi
-# The tunnel agent is started by `mmvpn up` and stopped by `mmvpn down`. RunAtLoad brings it back
+# The tunnel agent is started by `mmvpn set` with any route and stopped when every route is off. RunAtLoad brings it back
 # after a restart, so routing that was on before a restart works again after it.
 agent tunnel true "$BIN_DIR/mmvpn-tunnel"
 if "$LAUNCHCTL" print "gui/$(id -u)/$ID.tunnel" >/dev/null 2>&1; then reload tunnel; fi
@@ -139,4 +142,8 @@ fi
 echo
 echo "Installed. Next:"
 echo "  1. Check the Mac in Japan answers:  ssh $HOME_MAC true"
-echo "  2. Turn it on from the menu bar (the Mac mini icon), or: $BIN_DIR/mmvpn up"
+echo "  2. Turn routes on from the menu bar (the Mac mini icon), or: $BIN_DIR/mmvpn set sites"
+echo "  3. Optional, for the Terminal tools switch: point programs that read HTTPS_PROXY at the relay,"
+echo "     for example in your shell profile:"
+echo "       export HTTPS_PROXY=http://127.0.0.1:$PAC_PORT NO_PROXY=localhost,127.0.0.1,::1,.local"
+echo "     They go direct while the switch is off, and also whenever the tunnel is down."

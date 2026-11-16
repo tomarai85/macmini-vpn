@@ -11,12 +11,12 @@ APP_DIR="${MMVPN_APP_DIR:-$HOME/Applications}"
 AGENTS="${MMVPN_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 LAUNCHCTL="${LAUNCHCTL_BIN:-launchctl}"
 NETWORKSETUP="${NETWORKSETUP_BIN:-networksetup}"
-PAC="http://127.0.0.1:${PAC_PORT:-1081}/jp.pac"
+PAC="http://127.0.0.1:${PAC_PORT:-1081}/jp.pac"   # with or without ?routes=
 
 # Routing off, but only where it points at our PAC: another proxy setting is not ours to clear.
 "$NETWORKSETUP" -listallnetworkservices 2>/dev/null | tail -n +2 | sed 's/^\*//' | while read -r svc; do
   [ -z "$svc" ] && continue
-  if "$NETWORKSETUP" -getautoproxyurl "$svc" 2>/dev/null | grep -q "^URL: $PAC$"; then
+  if "$NETWORKSETUP" -getautoproxyurl "$svc" 2>/dev/null | grep -qE "^URL: $PAC(\?routes=.*)?$"; then
     "$NETWORKSETUP" -setautoproxystate "$svc" off >/dev/null 2>&1
   fi
 done
@@ -24,7 +24,7 @@ for s in app tunnel kcp pac; do
   "$LAUNCHCTL" bootout "gui/$(id -u)/$ID.$s" >/dev/null 2>&1
   rm -f "$AGENTS/$ID.$s.plist"
 done
-rm -f "$BIN_DIR/mmvpn" "$BIN_DIR/mmvpn-tunnel"
+rm -f "$BIN_DIR/mmvpn" "$BIN_DIR/mmvpn-proxy" "$BIN_DIR/mmvpn-tunnel" "$CONF_DIR/tools-via-japan"
 rm -rf "$APP_DIR/Mac mini VPN.app"
 if [ "${1:-}" = "--all" ]; then rm -rf "$CONF_DIR"; echo "removed, including $CONF_DIR"
 else echo "removed (kept your settings in $CONF_DIR; --all removes them too)"; fi

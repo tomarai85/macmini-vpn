@@ -1,12 +1,18 @@
-// Mac mini VPN — a menu-bar switch that sends a few Japanese sites through a Mac at home in Japan.
+// Mac mini VPN — a menu-bar app that chooses what leaves through a Mac at home in Japan.
 //
-// This app only switches routing on and off (by running `mmvpn up` / `mmvpn down`) and shows
-// whether it works. The tunnel itself is kept open by `mmvpn-tunnel` under launchd, which also
-// repairs it, so quitting the app changes nothing.
+// This app only switches routes (by running `mmvpn set ...`) and shows whether the exit works. The
+// tunnel itself is kept open by `mmvpn-tunnel` under launchd, which also repairs it, so quitting the
+// app changes nothing.
 //
-// WHAT "ON" MEANS: the system's automatic-proxy URL points at our PAC file. That is the one setting
-// `mmvpn up` writes and `mmvpn down` clears. Reading "on" from whether the SOCKS port answers made the
-// icon flicker to "off" every time the tunnel was rebuilt.
+// THREE SWITCHES, each on or off; all three on means everything goes through Japan:
+//   Chosen sites      the sites in ~/.config/macmini-vpn/sites (PAC)
+//   Terminal tools    programs that read HTTPS_PROXY, such as Claude Code (mmvpn-proxy's relay)
+//   Everything else   browsers and every other app that follows the system proxy setting (PAC)
+// What is on is read from the machine, never from what the app last asked for:
+//   sites, rest   the automatic-proxy URL, http://127.0.0.1:1081/jp.pac?routes=sites,rest&v=...
+//   tools         the file ~/.config/macmini-vpn/tools-via-japan, read by the relay per connection
+// Every switch runs `mmvpn set <the whole new set>`. Reading "on" from whether the SOCKS port
+// answered made the icon flicker to "off" every time the tunnel was rebuilt.
 //
 // WHY "ABEMA ACCEPTS" AND NOT "CONNECTED": a data-centre address can be located in Japan and still be
 // refused, so the health shown is ABEMA's own region verdict through the tunnel, not "something
@@ -15,10 +21,13 @@
 // LOOK
 //   * Icon: a rounded box with one lamp (green on, red off, orange on a problem), drawn on whole
 //     pixels so it stays sharp on a 1x display. Its outline follows the menu bar's light/dark look.
-//   * Menu: one panel with a switch, a status line that is always exactly one line, and the sites.
+//   * Menu: one panel with a status line that is always exactly one line and a switch per route.
 //     Its size never changes and it is updated in place while open.
 //   * `MacminiVPN --render <dir>` draws every state to PNGs (1x and 2x, light and dark);
 //     `MacminiVPN --selftest` checks the state rules and the drawing without touching the system.
+//
+// The process runner drains output on a background queue and waits on a semaphore, so its timeout
+// can actually fire: readDataToEndOfFile() alone blocks until the child closes the pipe.
 
 import AppKit
 
@@ -40,11 +49,26 @@ func readConfig(_ path: String) -> [String: String] {
     }
     return out
 }
+
 let CONF = readConfig(CONF_DIR + "/config")
 let CTL = ENV["MMVPN_CTL"] ?? NSString(string: "~/.local/bin/mmvpn").expandingTildeInPath
-let PAC_URL = "http://127.0.0.1:\(CONF["PAC_PORT"] ?? "1081")/jp.pac"   // what `mmvpn up` sets
+let PAC_BASE = "http://127.0.0.1:\(CONF["PAC_PORT"] ?? "1081")/jp.pac"   // `mmvpn set` adds ?routes=
+let TOOLS_FLAG = CONF_DIR + "/tools-via-japan"                          // present while tools is on
 let PROXY_PORT = UInt16(CONF["SOCKS_PORT"] ?? "") ?? 1082                // the tunnel's SOCKS port
-let SITES = ["Netflix", "ABEMA", "TVer", "radiko", "NHK"]               // the sites jp.pac lists
+
+/// What can go through Japan. Raw values are `mmvpn set`'s words.
+enum Route: String, CaseIterable, Comparable {
+    case sites, tools, rest
+    var title: String {
+        switch self { case .sites: return "Chosen sites"; case .tools: return "Terminal tools"
+                      case .rest: return "Everything else" } }
+    var hint: String {
+        switch self { case .sites: return "Your site list, sign-in and video included"
+                      case .tools: return "Programs set to use HTTPS_PROXY"
+                      case .rest: return "Browsers and other apps" } }
+    static func < (a: Route, b: Route) -> Bool {
+        allCases.firstIndex(of: a)! < allCases.firstIndex(of: b)! }
+}
 let UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
          "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 
@@ -87,14 +111,16 @@ enum Verdict { case unknown, japan, notJapan, noAnswer }
 enum Look { case off, checking, good, problem, switchingOn, switchingOff }
 
 struct State {
-    var enabled = false          // the automatic-proxy URL points at jp.pac
-    var switching: Bool? = nil   // set while `mmvpn up` (true) or `down` (false) runs
+    var routes = Set<Route>()    // what goes through Japan now, read from the machine
+    var switching: Set<Route>? = nil   // the set being applied while `mmvpn set` runs
     var verdict = Verdict.unknown
     var misses = 0               // consecutive checks that did not come back Japan
     var failure: String? = nil   // why the last switch failed; cleared by the next one
 
+    var enabled: Bool { !routes.isEmpty }
+
     var look: Look {
-        if let on = switching { return on ? .switchingOn : .switchingOff }
+        if let target = switching { return target.isEmpty ? .switchingOff : .switchingOn }
         guard enabled else { return .off }
         switch verdict {
         case .japan: return .good
@@ -118,17 +144,18 @@ func fold(_ v: Verdict, into s: inout State) -> Bool {
 
 /// The one status line under the title, and its dot colour. Always exactly one line.
 func statusLine(_ s: State) -> (text: String, color: NSColor) {
+    // A failed switch is shown until the next switch, or until the exit answers from Japan again.
+    if let f = s.failure, s.switching == nil { return (f, .systemOrange) }
     switch s.look {
     case .good:         return ("Connected via Japan", .systemGreen)
     case .checking:     return ("Checking…", .tertiaryLabelColor)
-    case .switchingOn:  return ("Turning on…", .tertiaryLabelColor)
+    case .switchingOn:  return (s.enabled ? "Switching…" : "Turning on…", .tertiaryLabelColor)
     case .switchingOff: return ("Turning off…", .tertiaryLabelColor)
     case .problem:
         // The tunnel repairs itself, so the line says that instead of asking for action.
         return s.verdict == .notJapan ? ("Not seen as Japan", .systemOrange)
                                       : ("Reconnecting…", .systemOrange)
     case .off:
-        if let f = s.failure { return (f, .systemOrange) }
         return ("Off · everything as usual", .systemRed)
     }
 }
@@ -181,9 +208,10 @@ func icon(_ look: Look, dark: Bool) -> NSImage {
     let fg = dark ? NSColor.white : NSColor.black
     let img = miniImage(body: fg, light: light(look, dim: fg.withAlphaComponent(0.35)))
     img.isTemplate = false
-    img.accessibilityDescription = "Mac mini VPN: " + statusLine({ var s = State(); s.enabled = look != .off
+    img.accessibilityDescription = "Mac mini VPN: " + statusLine({ var s = State()
+        if look != .off { s.routes = [.sites] }
         s.verdict = look == .good ? .japan : (look == .problem ? .noAnswer : .unknown)
-        s.switching = look == .switchingOn ? true : (look == .switchingOff ? false : nil); return s }()).text
+        s.switching = look == .switchingOn ? [.sites] : (look == .switchingOff ? [] : nil); return s }()).text
     return img
 }
 
@@ -245,7 +273,7 @@ final class Toggle: NSView {
     }
 }
 
-/// The whole menu above "Quit": title, one status line and a switch; then the five sites.
+/// The whole menu above "Quit": title and one status line, then one switch per route.
 /// Fixed size and updated in place (`show`), so the open menu never jumps.
 final class Panel: NSView {
     let tile = Canvas()
@@ -253,12 +281,9 @@ final class Panel: NSView {
     let dot = Canvas()
     let spinner = NSProgressIndicator()
     let status = NSTextField(labelWithString: "")
-    let toggle = Toggle(frame: NSRect(x: 0, y: 0, width: 40, height: 24))
     let rule = NSBox()
-    let caption = NSTextField(labelWithString: "Only these 5 go through Japan")
-    var chips: [(Canvas, NSTextField)] = []
-    let note = NSTextField(labelWithString: "Search and all other sites go direct, as usual")
-    var onToggle: ((Bool) -> Void)?
+    var rows: [(route: Route, toggle: Toggle, label: NSTextField, hint: NSTextField)] = []
+    var onChange: ((Route, Bool) -> Void)?
     private var look = Look.off
     private var dotColor = NSColor.tertiaryLabelColor
 
@@ -266,7 +291,8 @@ final class Panel: NSView {
 
     init() {
         super.init(frame: .zero)
-        let pad: CGFloat = 14, chipFont = NSFont.systemFont(ofSize: 12, weight: .medium)
+        let pad: CGFloat = 14, top: CGFloat = 64, rowH: CGFloat = 42
+        let labelFont = NSFont.systemFont(ofSize: 13, weight: .medium), hintFont = NSFont.systemFont(ofSize: 11)
 
         tile.paint = { [unowned self] r in self.paintTile(r) }
         tile.topDown = false   // the Mac mini is drawn bottom-up
@@ -291,50 +317,36 @@ final class Panel: NSView {
         status.lineBreakMode = .byTruncatingTail
         addSubview(status)
 
-        toggle.onChange = { [unowned self] on in self.onToggle?(on) }
-        addSubview(toggle)
-
         rule.boxType = .separator
         addSubview(rule)
 
-        caption.font = .systemFont(ofSize: 11, weight: .medium)
-        caption.textColor = .secondaryLabelColor
-        addSubview(caption)
-        for name in SITES {
-            let bg = Canvas()
-            bg.paint = { r in
-                // Not .withAlphaComponent on a system colour: that REPLACES its alpha (white at 60 %
-                // in dark mode, seen in --render), it does not fade it.
-                NSColor.quaternaryLabelColor.setFill()
-                NSBezierPath(roundedRect: r, xRadius: r.height / 2, yRadius: r.height / 2).fill() }
-            let l = NSTextField(labelWithString: name)
-            l.font = chipFont
-            l.alignment = .center
-            bg.addSubview(l)
-            addSubview(bg)
-            chips.append((bg, l))
+        // Width: whichever is wider of 320 and the longest label or hint beside a switch.
+        var textW: CGFloat = 0
+        for r in Route.allCases {
+            textW = max(textW, ceil((r.title as NSString).size(withAttributes: [.font: labelFont]).width),
+                        ceil((r.hint as NSString).size(withAttributes: [.font: hintFont]).width))
         }
-        note.font = .systemFont(ofSize: 11)
-        note.textColor = .secondaryLabelColor
-        addSubview(note)
-
-        // Width: whichever is widest of the chip row and the note, so nothing is clipped.
-        var x = pad
-        for (bg, l) in chips {
-            let w = ceil((l.stringValue as NSString).size(withAttributes: [.font: chipFont]).width) + 18
-            bg.frame = NSRect(x: x, y: 88, width: w, height: 22)
-            l.frame = NSRect(x: 0, y: 3, width: w, height: 16)
-            x += w + 6
+        let toggleW: CGFloat = 40
+        let width = max(320, pad + textW + 4 + 12 + toggleW + pad)
+        let textFrameW = width - 2 * pad - toggleW - 12
+        for (i, r) in Route.allCases.enumerated() {
+            let y = top + CGFloat(i) * rowH
+            let l = NSTextField(labelWithString: r.title)
+            l.font = labelFont
+            l.frame = NSRect(x: pad, y: y + 4, width: textFrameW, height: 17)
+            let h = NSTextField(labelWithString: r.hint)
+            h.font = hintFont
+            h.textColor = .secondaryLabelColor
+            h.frame = NSRect(x: pad, y: y + 21, width: textFrameW, height: 14)
+            let t = Toggle(frame: NSRect(x: width - pad - toggleW, y: y + 7, width: toggleW, height: 24))
+            t.setAccessibilityLabel(r.title)
+            t.onChange = { [unowned self] on in self.onChange?(r, on) }
+            addSubview(l); addSubview(h); addSubview(t)
+            rows.append((r, t, l, h))
         }
-        let noteW = ceil((note.stringValue as NSString).size(withAttributes: [.font: note.font!]).width) + 4
-        let width = max(320, x - 6 + pad, noteW + 2 * pad)
-        toggle.frame.origin = NSPoint(x: width - pad - toggle.frame.width,
-                                      y: 28 - toggle.frame.height / 2)
-        status.frame = NSRect(x: pad + 58, y: 29, width: toggle.frame.minX - (pad + 58) - 8, height: 16)
+        status.frame = NSRect(x: pad + 58, y: 29, width: width - (pad + 58) - pad, height: 16)
         rule.frame = NSRect(x: pad, y: 56, width: width - 2 * pad, height: 1)
-        caption.frame = NSRect(x: pad, y: 66, width: width - 2 * pad, height: 15)
-        note.frame = NSRect(x: pad, y: 118, width: width - 2 * pad, height: 15)
-        frame = NSRect(x: 0, y: 0, width: width, height: 142)
+        frame = NSRect(x: 0, y: 0, width: width, height: top + CGFloat(Route.allCases.count) * rowH + 8)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -347,6 +359,8 @@ final class Panel: NSView {
             .draw(in: NSRect(x: r.midX - w / 2, y: r.midY - h / 2, width: w, height: h))
     }
 
+    func toggle(_ r: Route) -> Toggle { rows.first { $0.route == r }!.toggle }
+
     func show(_ s: State) {
         look = s.look
         let line = statusLine(s)
@@ -356,11 +370,13 @@ final class Panel: NSView {
         let busy = s.switching != nil
         dot.isHidden = busy
         if busy { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
-        // The switch shows what was asked for while it is being done, then what is true.
-        toggle.isOn = s.switching ?? s.enabled
-        toggle.isEnabled = !busy
-        let on = s.switching ?? s.enabled
-        for (_, l) in chips { l.textColor = on ? .labelColor : .secondaryLabelColor }
+        // The switches show what was asked for while it is being done, then what is true.
+        let shown = s.switching ?? s.routes
+        for row in rows {
+            row.toggle.isOn = shown.contains(row.route)
+            row.toggle.isEnabled = !busy
+            row.label.textColor = busy ? .secondaryLabelColor : .labelColor
+        }
         tile.needsDisplay = true
         dot.needsDisplay = true
     }
@@ -368,11 +384,33 @@ final class Panel: NSView {
 
 // -------------------------------------------------------------------------------- controller
 
-/// Whether the automatic-proxy URL points at jp.pac: the setting `mmvpn up` writes.
-func pacEnabled() -> Bool {
-    guard let d = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
-        return false }
-    return (d["ProxyAutoConfigEnable"] as? Int) == 1 && (d["ProxyAutoConfigURLString"] as? String) == PAC_URL
+/// The routes a PAC URL carries. The bare URL (what the one-switch version set) is the sites, as
+/// mmvpn-proxy serves it. Terminal tools are never routed by a PAC, so they are never read from one.
+func pacRoutes(_ url: String) -> Set<Route> {
+    guard url == PAC_BASE || url.hasPrefix(PAC_BASE + "?") else { return [] }
+    guard let q = URLComponents(string: url)?.queryItems?.first(where: { $0.name == "routes" }) else {
+        return [.sites] }
+    return Set((q.value ?? "").split(separator: ",").compactMap { Route(rawValue: String($0)) })
+        .subtracting([.tools])
+}
+
+/// The set after one switch changes: only that switch's route moves.
+func applying(_ r: Route, _ on: Bool, to routes: Set<Route>) -> Set<Route> {
+    on ? routes.union([r]) : routes.subtracting([r])
+}
+
+/// `mmvpn set` with the whole set, in a fixed order.
+func setArgs(_ t: Set<Route>) -> [String] { ["set"] + t.sorted().map(\.rawValue) }
+
+/// What goes through Japan now: the automatic-proxy URL plus the terminal-tools flag.
+func currentRoutes() -> Set<Route> {
+    var r = Set<Route>()
+    if let d = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any],
+       (d["ProxyAutoConfigEnable"] as? Int) == 1, let url = d["ProxyAutoConfigURLString"] as? String {
+        r = pacRoutes(url)
+    }
+    if FileManager.default.fileExists(atPath: TOOLS_FLAG) { r.insert(.tools) }
+    return r
 }
 
 func portOpen() -> Bool {
@@ -418,14 +456,14 @@ final class Controller: NSObject, NSMenuDelegate {
         menu.addItem(p)
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        quit.toolTip = "Closes the icon only. Mac mini VPN stays on or off as it is."
+        quit.toolTip = "Closes the icon only. What goes through Japan stays as it is."
         menu.addItem(quit)
         item.menu = menu
-        panel.onToggle = { [weak self] on in self?.flip(on) }
+        panel.onChange = { [weak self] r, on in self?.flip(r, on) }
         // The Mac mini is drawn in the bar's own text colour; redraw when the bar turns light/dark.
         watch = item.button?.observe(\.effectiveAppearance) { [weak self] _, _ in
             DispatchQueue.main.async { self?.render() } }
-        state.enabled = pacEnabled()
+        state.routes = currentRoutes()
         render()
         check()
         // .common so both keep running while the menu is open.
@@ -435,13 +473,13 @@ final class Controller: NSObject, NSMenuDelegate {
         RunLoop.main.add(recheck, forMode: .common)
     }
 
-    /// Notice a switch made elsewhere (`mmvpn up/down` in a terminal) within five seconds.
+    /// Notice a change made elsewhere (`mmvpn set` in a terminal) within five seconds.
     func poll() {
         guard state.switching == nil else { return }
-        let on = pacEnabled()
-        guard on != state.enabled else { return }
+        let now = currentRoutes()
+        guard now != state.routes else { return }
         gen += 1
-        state.enabled = on
+        state.routes = now
         state.verdict = .unknown
         state.misses = 0
         render()
@@ -462,29 +500,35 @@ final class Controller: NSObject, NSMenuDelegate {
                 if fold(v, into: &self.state) {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.check() }
                 }
+                if self.state.verdict == .japan { self.state.failure = nil }
                 self.render()
             }
         }
     }
 
-    func flip(_ on: Bool) {
+    /// One switch changed: apply the whole new set with `mmvpn set`.
+    func flip(_ r: Route, _ on: Bool) {
         guard state.switching == nil else { return }
+        let target = applying(r, on, to: state.routes)
+        guard target != state.routes else { render(); return }
         gen += 1
-        state.switching = on
+        state.switching = target
         state.failure = nil
         render()
+        let args = [CTL] + setArgs(target)
         DispatchQueue.global().async { [weak self] in
-            // `up` waits up to 40 s for the tunnel to answer from Japan before routing anything.
-            let (code, _) = sh("/bin/bash", [CTL, on ? "up" : "down"], timeout: 300)
+            // Adding a route waits up to 40 s for the Mac mini to answer from Japan; on a failure
+            // nothing changes, so the switch falls back to what is true.
+            let (code, _) = sh("/bin/bash", args, timeout: 300)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.gen += 1
                 self.state.switching = nil
-                self.state.enabled = pacEnabled()
+                self.state.routes = currentRoutes()
                 self.state.verdict = .unknown
                 self.state.misses = 0
                 if code != 0 {
-                    self.state.failure = on ? "Home Mac not responding" : "Couldn't turn off"
+                    self.state.failure = target.isEmpty ? "Couldn't turn off" : "Home Mac not responding"
                 }
                 self.render()
                 self.check()
@@ -514,16 +558,20 @@ final class Controller: NSObject, NSMenuDelegate {
 /// and dark, to PNGs, and exit. The status item itself cannot be screenshotted here.
 func renderPreviews(to dir: String) {
     let states: [(String, State)] = {
-        var good = State(); good.enabled = true; good.verdict = .japan
-        var checking = State(); checking.enabled = true
-        var problem = State(); problem.enabled = true; problem.verdict = .noAnswer
-        var notJP = State(); notJP.enabled = true; notJP.verdict = .notJapan
+        var good = State(); good.routes = [.sites]; good.verdict = .japan
+        var both = State(); both.routes = [.sites, .tools]; both.verdict = .japan
+        var all = State(); all.routes = Set(Route.allCases); all.verdict = .japan
+        var checking = State(); checking.routes = [.tools]
+        var problem = State(); problem.routes = [.sites]; problem.verdict = .noAnswer
+        var notJP = State(); notJP.routes = [.sites]; notJP.verdict = .notJapan
         let off = State()
         var failed = State(); failed.failure = "Home Mac not responding"
-        var turningOn = State(); turningOn.switching = true
-        var turningOff = State(); turningOff.enabled = true; turningOff.switching = false
-        return [("good", good), ("checking", checking), ("problem", problem), ("notjapan", notJP),
-                ("off", off), ("failed", failed), ("turning-on", turningOn), ("turning-off", turningOff)]
+        var turningOn = State(); turningOn.switching = [.sites]
+        var switching = State(); switching.routes = [.sites]; switching.switching = [.sites, .tools]
+        var turningOff = State(); turningOff.routes = [.sites]; turningOff.switching = []
+        return [("good", good), ("sites-tools", both), ("all", all), ("checking", checking),
+                ("problem", problem), ("notjapan", notJP), ("off", off), ("failed", failed),
+                ("turning-on", turningOn), ("switching", switching), ("turning-off", turningOff)]
     }()
     for (mode, name) in [("dark", NSAppearance.Name.darkAqua), ("light", .aqua)] {
         let appearance = NSAppearance(named: name)!
@@ -569,27 +617,48 @@ func renderPreviews(to dir: String) {
 func selftest() -> Int32 {
     var fails = 0
     func expect(_ name: String, _ ok: Bool) { print(ok ? "  PASS  \(name)" : "  FAIL  \(name)"); if !ok { fails += 1 } }
-    var s = State(); s.enabled = true; s.verdict = .japan
+    var s = State(); s.routes = [.sites]; s.verdict = .japan
     expect("one failed check does not change what is shown", fold(.noAnswer, into: &s) && s.look == .good)
     expect("two failed checks in a row show a problem", !fold(.noAnswer, into: &s) && s.look == .problem)
-    expect("an answer from Japan recovers at once", !fold(.japan, into: &s) && s.look == .good && s.misses == 0)
+    expect("Japan again recovers at once", !fold(.japan, into: &s) && s.look == .good && s.misses == 0)
     s.verdict = .unknown; s.misses = 0
-    expect("one failure during the first check stays \"checking\"", fold(.notJapan, into: &s) && s.look == .checking)
-    expect("two non-Japan answers mean not seen as Japan", !fold(.notJapan, into: &s) && s.verdict == .notJapan)
+    expect("a first miss while checking stays checking", fold(.notJapan, into: &s) && s.look == .checking)
+    expect("two not-Japan answers read as not seen as Japan", !fold(.notJapan, into: &s) && s.verdict == .notJapan)
     var off = State()
     expect("off is off", off.look == .off && statusLine(off).text.hasPrefix("Off"))
     off.failure = "x"
-    expect("the reason for a failed switch shows on the off line", statusLine(off).text == "x")
-    var sw = State(); sw.enabled = false; sw.switching = true
-    expect("switching shows switching", sw.look == .switchingOn)
+    expect("a failure shows on the off line", statusLine(off).text == "x")
+    var onFail = State(); onFail.routes = [.sites]; onFail.verdict = .japan; onFail.failure = "Home Mac not responding"
+    expect("a failed add shows while the other routes stay on", statusLine(onFail).text == "Home Mac not responding")
+    var sw = State(); sw.switching = [.sites]
+    expect("from off: Turning on", sw.look == .switchingOn && statusLine(sw).text == "Turning on…")
+    sw.routes = [.sites]; sw.switching = [.sites, .tools]
+    expect("adding to a running set: Switching", statusLine(sw).text == "Switching…")
+    sw.switching = []
+    expect("removing the last route: Turning off", sw.look == .switchingOff && statusLine(sw).text == "Turning off…")
+
+    // What is on is read back from the PAC URL that `mmvpn set` writes.
+    expect("the bare PAC URL is the sites", pacRoutes(PAC_BASE) == [.sites])
+    expect("routes=sites,rest", pacRoutes(PAC_BASE + "?routes=sites,rest") == [.sites, .rest])
+    expect("routes=rest", pacRoutes(PAC_BASE + "?routes=rest") == [.rest])
+    expect("the version after the routes is ignored", pacRoutes(PAC_BASE + "?routes=sites,rest&v=1a2b3c4d") == [.sites, .rest])
+    expect("an empty routes= is nothing", pacRoutes(PAC_BASE + "?routes=").isEmpty)
+    expect("terminal tools are never read from a PAC", pacRoutes(PAC_BASE + "?routes=tools,sites") == [.sites])
+    expect("another PAC is nothing", pacRoutes("http://127.0.0.1:1081/other.pac").isEmpty
+           && pacRoutes("http://example.com/jp.pac").isEmpty && pacRoutes(PAC_BASE + "x?routes=sites").isEmpty)
+    // A switch changes only its own route, and `mmvpn set` gets the whole set in a fixed order.
+    expect("adding terminal tools keeps the sites", applying(.tools, true, to: [.sites]) == [.sites, .tools])
+    expect("removing the sites keeps the rest", applying(.sites, false, to: [.sites, .rest]) == [.rest])
+    expect("mmvpn gets the whole set in order", setArgs([.rest, .sites, .tools]) == ["set", "sites", "tools", "rest"])
+    expect("an empty set turns everything off", setArgs([]) == ["set"])
     for look in [Look.off, .checking, .good, .problem, .switchingOn, .switchingOff] {
         for dark in [true, false] {
             let i = icon(look, dark: dark)
-            expect("icon has the same size in every state (\(look), \(dark ? "dark" : "light"))",
+            expect("the icon has the same size in every state (\(look), \(dark ? "dark" : "light"))",
                    i.size == ICON_SIZE)
         }
     }
-    // The bar centres the image, so the body's middle must be the image's middle (y 8), and the lamp
+    // The bar centres the image, so the box's middle must be the image's middle (y 8), and the lamp
     // must not be cut off at the top.
     func extent(_ img: NSImage) -> (lo: CGFloat, hi: CGFloat) {
         let k: CGFloat = 8
@@ -610,39 +679,51 @@ func selftest() -> Int32 {
     expect("the box is centred vertically (y 8±0.25): \(bodyOnly)", abs((bodyOnly.lo + bodyOnly.hi) / 2 - ICON_SIZE.height / 2) <= 0.25)
     let whole = extent(miniImage(body: .white, light: .systemGreen))
     expect("the lamp is not clipped: \(whole)", whole.hi <= ICON_SIZE.height - 0.1)
-    let heights = Set([State(), { var x = State(); x.enabled = true; x.verdict = .noAnswer; return x }(),
-                       { var x = State(); x.failure = "Home Mac not responding"; return x }()]
+    let heights = Set([State(), { var x = State(); x.routes = [.sites]; x.verdict = .noAnswer; return x }(),
+                       { var x = State(); x.failure = "Home Mac not responding"; return x }(),
+                       { var x = State(); x.switching = Set(Route.allCases); return x }()]
         .map { st -> CGFloat in let p = Panel(); p.show(st); return p.frame.height })
-    expect("the panel height is the same in every state", heights.count == 1)
-    // The switch reaches the controller with the state asked for, and is locked while switching.
+    expect("the panel height does not change with the state", heights.count == 1)
+    // Each switch reaches the controller with its own route and the state asked for.
     let sp = Panel()
-    var asked: Bool? = nil
-    sp.onToggle = { asked = $0 }
+    var asked: (Route, Bool)? = nil
+    sp.onChange = { asked = ($0, $1) }
     sp.show(State())
-    expect("the switch is red when off", sp.toggle.trackColor == .systemRed && !sp.toggle.isOn)
-    sp.toggle.press()
-    expect("pressing the switch when off asks for on", asked == true)
-    var onState = State(); onState.enabled = true; onState.verdict = .japan
-    sp.show(onState)
-    expect("the switch is green when on", sp.toggle.trackColor == .systemGreen && sp.toggle.isOn)
+    expect("one switch per route, in order", sp.rows.map(\.route) == Route.allCases)
+    expect("off switches are red", Route.allCases.allSatisfy {
+        sp.toggle($0).trackColor == .systemRed && !sp.toggle($0).isOn })
+    sp.toggle(.tools).press()
+    expect("pressing terminal tools from off asks for them on", asked?.0 == .tools && asked?.1 == true)
+    var on = State(); on.routes = [.sites, .rest]; on.verdict = .japan
+    sp.show(on)
+    expect("each switch shows its own route", sp.toggle(.sites).isOn && !sp.toggle(.tools).isOn && sp.toggle(.rest).isOn)
+    expect("on switches are green", sp.toggle(.sites).trackColor == .systemGreen)
     expect("the lamp is green on and red off", light(.good, dim: .gray) == .systemGreen && light(.off, dim: .gray) == .systemRed)
-    var busy = State(); busy.switching = true
+    sp.toggle(.sites).press()
+    expect("pressing an on switch asks for it off", asked?.0 == .sites && asked?.1 == false)
+    var busy = State(); busy.routes = [.sites]; busy.switching = [.sites, .tools]
     sp.show(busy)
+    expect("while switching, the switches show the set being applied", sp.toggle(.tools).isOn && sp.toggle(.sites).isOn)
     asked = nil
-    sp.toggle.press()
-    expect("the switch cannot be pressed while switching", !sp.toggle.isEnabled && sp.toggle.isOn && asked == nil)
-    // Every status line fits its one line: a truncated "…" was the first --render of this panel.
+    sp.toggle(.rest).press()
+    expect("while switching, no switch can be pressed", !sp.toggle(.rest).isEnabled && asked == nil && !sp.toggle(.rest).isOn)
+    // Every status line, label and hint fits its one line: a truncated "…" was the first --render.
     let probePanel = Panel()
-    for look in [Verdict.japan, .unknown, .noAnswer, .notJapan] {
-        var x = State(); x.enabled = true; x.verdict = look
+    func fits(_ t: String, _ f: NSTextField) -> Bool {
+        (t as NSString).size(withAttributes: [.font: f.font!]).width + 4 <= f.frame.width }
+    for v in [Verdict.japan, .unknown, .noAnswer, .notJapan] {
+        var x = State(); x.routes = [.sites]; x.verdict = v
         for st in [x, State(), { var f = State(); f.failure = "Home Mac not responding"; return f }(),
                    { var f = State(); f.failure = "Couldn't turn off"; return f }(),
-                   { var f = State(); f.switching = true; return f }(),
-                   { var f = State(); f.enabled = true; f.switching = false; return f }()] {
+                   { var f = State(); f.switching = [.sites]; return f }(),
+                   { var f = State(); f.routes = [.sites]; f.switching = [.sites, .rest]; return f }(),
+                   { var f = State(); f.routes = [.sites]; f.switching = []; return f }()] {
             let t = statusLine(st).text
-            let w = (t as NSString).size(withAttributes: [.font: probePanel.status.font!]).width
-            expect("the status line fits on one line: \(t)", w + 4 <= probePanel.status.frame.width)
+            expect("the status line fits one line: \(t)", fits(t, probePanel.status))
         }
+    }
+    for row in probePanel.rows {
+        expect("\(row.route.title) and its hint fit", fits(row.route.title, row.label) && fits(row.route.hint, row.hint))
     }
     print(fails == 0 ? "  selftest OK" : "  selftest FAIL \(fails)")
     return fails == 0 ? 0 : 1
@@ -651,7 +732,7 @@ func selftest() -> Int32 {
 let app = NSApplication.shared
 if CommandLine.arguments.contains("--selftest") { exit(selftest()) }
 if CommandLine.arguments.contains("--print-config") {   // what this app will use (for the tests)
-    print("pac \(PAC_URL)\nsocks \(PROXY_PORT)\nctl \(CTL)")
+    print("pac \(PAC_BASE)\nsocks \(PROXY_PORT)\nctl \(CTL)\nflag \(TOOLS_FLAG)")
     exit(0)
 }
 if let i = CommandLine.arguments.firstIndex(of: "--render"), i + 1 < CommandLine.arguments.count {

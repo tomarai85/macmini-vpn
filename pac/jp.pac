@@ -1,61 +1,50 @@
-// jp.pac — which sites go through the Mac in Japan. Everything not listed here goes DIRECT.
-//
-// The installer copies this file to ~/.config/macmini-vpn/pac/jp.pac and replaces the port in
-// PROXY with your SOCKS_PORT. To add a site, add its domain to `jp` (and, if its video comes from
-// another domain, to `media`), then run ./install.sh again.
-//
-// NETFLIX: every Netflix host, sign-in included, goes through the same exit. If the sign-in came
-// from your own country and the playback from Japan, the session would mix two countries, and
-// Netflix refuses that (error M7037).
-//
-// SIGN-IN AND PAYMENT PAGES of the other services stay DIRECT (the `sensitive` list), so your
-// account and card pages are never sent through the tunnel when they don't need to be.
+// jp.pac — which traffic leaves through the Mac in Japan. This is a template: mmvpn-proxy serves it on
+// 127.0.0.1:PAC_PORT and fills in three things:
+//   ROUTES  from the URL `mmvpn set` writes as the system's automatic-proxy URL
+//           (http://127.0.0.1:1081/jp.pac?routes=sites,rest&v=...):
+//             sites  the sites in ~/.config/macmini-vpn/sites
+//             rest   everything else that follows the system proxy setting: browsers and most apps
+//   SITES   from ~/.config/macmini-vpn/sites (edit that file, not this one)
+//   the SOCKS port of the tunnel, from SOCKS_PORT in the config
+// Terminal tools ignore PAC files; they use mmvpn-proxy's relay instead (HTTPS_PROXY). Anything not
+// chosen goes DIRECT. Served unfilled, this file sends everything DIRECT.
+var ROUTES = "__ROUTES__";
+var SITES = [/*__SITES__*/];
 
 function FindProxyForURL(url, host) {
   var h = ("" + host).toLowerCase();
   // A trailing dot is a legal form of a host name and would defeat a plain suffix match.
   if (h.charAt(h.length - 1) === ".") { h = h.substring(0, h.length - 1); }
+  var on = "," + ROUTES + ",";
+  // "SOCKS5" for Chromium browsers (the name is resolved in Japan); "SOCKS" for Safari and every app
+  // that uses Apple's PAC engine, which drops "SOCKS5" as unknown: with CFNetwork, "SOCKS5 x" gives
+  // no proxy at all and "SOCKS x" gives SOCKS x. Chromium reads "SOCKS" as SOCKS4 and tries it only
+  // if SOCKS5 fails on the same port.
+  var TUNNEL = "SOCKS5 127.0.0.1:__SOCKS_PORT__; SOCKS 127.0.0.1:__SOCKS_PORT__";
 
-  // Every label is checked, not only the first: foo.login.abema.tv is a sign-in host too.
-  var sensitive = ["account", "accounts", "billing", "payment", "pay", "login", "signin",
-                   "auth", "id", "my", "member", "mypage", "secure"];
-  var nfExempt = (h === "netflix.com" || dnsDomainIs(h, ".netflix.com"));
-  var labels = h.split(".");
-  if (!nfExempt) {
-    for (var L = 0; L < labels.length; L++) {
-      for (var s = 0; s < sensitive.length; s++) {
-        if (labels[L] === sensitive[s]) { return "DIRECT"; }
-      }
+  // This Mac's own networks never go through Japan: names without a dot, IPv6 literals, local
+  // suffixes, the tailnet, and loopback, private, link-local and CGNAT (Tailscale 100.64/10)
+  // addresses. The address test applies only to a whole IPv4 literal, so 10.example.com is a name.
+  var local = [".local", ".localhost", ".internal", ".lan", ".home.arpa", ".ts.net"];
+  if (h.indexOf(".") < 0 || h.indexOf(":") >= 0) { return "DIRECT"; }
+  for (var k = 0; k < local.length; k++) { if (dnsDomainIs(h, local[k])) { return "DIRECT"; } }
+  if (/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/.test(h) &&
+      /^(127|10)\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[01])\.|^169\.254\.|^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./.test(h)) {
+    return "DIRECT";
+  }
+
+  // The listed sites leave by one exit, pages, sign-in and video alike, with no DIRECT fallback.
+  // Some services refuse a session that signs in from one country and streams from another, and a
+  // fallback would quietly do exactly that whenever the tunnel blinked. With "sites" off, the sites
+  // go DIRECT even when "rest" is on: "rest" means everything except the switches above it.
+  for (var i = 0; i < SITES.length; i++) {
+    var s = SITES[i];
+    if (s.indexOf("*") >= 0 ? shExpMatch(h, s) : (h === s || dnsDomainIs(h, "." + s))) {
+      return on.indexOf(",sites,") >= 0 ? TUNNEL : "DIRECT";
     }
   }
 
-  var PROXY = "SOCKS5 127.0.0.1:1082";
-
-  var jp = ["tver.jp", "abema.tv", "abema.io", "radiko.jp", "nhk.or.jp", "nhk.jp",
-            "netflix.com"];
-  for (var i = 0; i < jp.length; i++) {
-    if (h === jp[i] || dnsDomainIs(h, "." + jp[i])) {
-      return PROXY;
-    }
-  }
-
-  // The video does not come from the same domain as the page. ABEMA streams from akamaized.net,
-  // radiko from smartstream.ne.jp and radiko-cf.com, NHK from drdi.st.nhk, Netflix from its own CDN.
-  // With only the page domains, the page loads through Japan and the video is then requested from
-  // your own country and refused.
-  //
-  // akamaized.net and smartstream.ne.jp are shared CDNs that carry other companies' traffic too, so
-  // each pattern requires the service name at a hyphen or label boundary (ds-vod-abematv..., not
-  // myabematvthing...). These host names were read from the services' own player configuration.
-  var media = ["*-abematv.akamaized.net", "abematv.akamaized.net",
-               "*-radiko.smartstream.ne.jp", "radiko.smartstream.ne.jp",
-               "*.radiko-cf.com",
-               "*.drdi.st.nhk",
-               "*.nflxvideo.net", "*.nflxso.net", "*.nflximg.net"];
-  for (var m = 0; m < media.length; m++) {
-    if (shExpMatch(h, media[m])) {
-      return PROXY;
-    }
-  }
-  return "DIRECT";
+  // Everything else, when chosen. DIRECT comes after the tunnel so that a site still opens while the
+  // home Mac is down.
+  return on.indexOf(",rest,") >= 0 ? TUNNEL + "; DIRECT" : "DIRECT";
 }

@@ -19,6 +19,8 @@ plutil -lint "$APP/Contents/Info.plist" >/dev/null && [ "$(defaults read "$APP/C
   && ok "bundle named Mac mini VPN" || bad "Info.plist"
 [ "$(defaults read "$APP/Contents/Info" LSUIElement)" = 1 ] && ok "menu-bar only (no Dock icon)" || bad "LSUIElement"
 codesign -v "$APP" 2>/dev/null && ok "signed (ad hoc)" || bad "codesign"
+[ "$(defaults read "$APP/Contents/Info" CFBundleIconFile)" = AppIcon ] && [ -s "$APP/Contents/Resources/AppIcon.icns" ] \
+  && ok "has its icon" || bad "icon missing"
 cp "$APP/Contents/MacOS/MacminiVPN" "$BIN"
 
 out="$("$BIN" --selftest 2>&1)"; rc=$?
@@ -27,7 +29,7 @@ out="$("$BIN" --selftest 2>&1)"; rc=$?
 mkdir -p "$D/conf"
 printf 'HOME_MAC="me@x"\nSOCKS_PORT=1192   # a comment\nPAC_PORT="1191"\n' > "$D/conf/config"
 cfg="$(MMVPN_CONFIG_DIR="$D/conf" MMVPN_CTL=/x/mmvpn "$BIN" --print-config)"
-[ "$cfg" = "$(printf 'pac http://127.0.0.1:1191/jp.pac\nsocks 1192\nctl /x/mmvpn')" ] \
+[ "$cfg" = "$(printf 'pac http://127.0.0.1:1191/jp.pac\nsocks 1192\nctl /x/mmvpn\nflag %s/conf/tools-via-japan' "$D")" ] \
   && ok "reads ports from the config (quotes and comments allowed)" || bad "config" "$cfg"
 cfg="$(MMVPN_CONFIG_DIR="$D/none" "$BIN" --print-config)"
 grep -q 'pac http://127.0.0.1:1081/jp.pac' <<<"$cfg" && grep -q 'socks 1082' <<<"$cfg" \

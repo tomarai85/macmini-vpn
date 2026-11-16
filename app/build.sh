@@ -5,11 +5,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 APP="${1:?usage: build.sh <path/Mac mini VPN.app> [bundle-id]}"
 BUNDLE_ID="${2:-com.macminivpn.app}"
-VERSION="1.0"
+VERSION="1.1"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O "$HERE/main.swift" -o "$APP/Contents/MacOS/MacminiVPN"
+# The app icon (drawn by appicon.swift; see the build line at its top to redraw it).
+cp "$HERE/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -18,6 +20,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleName</key><string>Mac mini VPN</string>
   <key>CFBundleDisplayName</key><string>Mac mini VPN</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>
